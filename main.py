@@ -211,15 +211,16 @@ def launch(token: str, request: Request, response: Response):
     if not site:
         return HTMLResponse("<h3>Tag non valido.</h3>", status_code=404)
 
-    if site["token_used"]:
-        return HTMLResponse("<h3>Tag già usato. Per usare la carta riporta il tag al dispositivo registrato o resetta il binding dall'admin.</h3>", status_code=403)
+    # Se è già bindato a qualche device e vuoi impedirne riuso via launch,
+    # puoi opzionalmente bloccare qui. Ma per il binding iniziale NON blocchiamo.
+    # if site["token_used"]:
+    #     return HTMLResponse("<h3>Tag già usato...</h3>", status_code=403)
 
     # Ensure device cookie present (so device can be bound later reliably)
     device_id = ensure_device_cookie(response, request)
 
-    # Create short session and mark token used (one-time)
+    # Create short session but DO NOT mark token as used yet — lo facciamo solo dopo l'unlock.
     sid = create_session_for_token(token)
-    mark_token_used(token)
 
     # set session cookie (httponly)
     response.set_cookie(SESSION_COOKIE_NAME, sid, max_age=SESSION_TTL, samesite="Lax", httponly=True)
@@ -233,6 +234,7 @@ def launch(token: str, request: Request, response: Response):
         "</body></html>"
     )
     return HTMLResponse(html)
+
 
 # CARD: reads session cookie, shows PIN form. does not expose token.
 @app.get("/card", response_class=HTMLResponse)
@@ -308,6 +310,8 @@ def unlock(request: Request, response: Response, token: str = Form(...), pin: st
     # If not yet bound -> bind now
     if not site["bound_device_id"]:
         bind_device_id(token, device_id)
+        # **Ora che il bind è avvenuto con successo**, possiamo marcare il token come usato
+        mark_token_used(token)
         site = get_by_token(token)
 
     # If bound but doesn't match -> block
@@ -344,6 +348,7 @@ def unlock(request: Request, response: Response, token: str = Form(...), pin: st
     """.format(name=html_lib.escape(site["name"]), balance=bal, token=html_lib.escape(site["token"]))
 
     return HTMLResponse(html)
+
 
 # TRANSFER: checks that from_token is bound to this device (device cookie)
 @app.post("/transfer", response_class=HTMLResponse)
