@@ -1,10 +1,11 @@
 # main.py
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
-import sqlite3, secrets, hashlib, time, pathlib
+import sqlite3, secrets, hashlib, time
 
 DB = "cards.db"
 SESSION_TTL = 60 * 5  # durata sessione in secondi (5 minuti)
+ADMIN_KEY = "bunald1"  # <-- CAMBIALA!
 
 app = FastAPI()
 
@@ -12,7 +13,6 @@ app = FastAPI()
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    # tabella cards
     c.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,7 +23,6 @@ def init_db():
             bound_fingerprint TEXT
         )
     """)
-    # tabella sessions
     c.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             sid TEXT PRIMARY KEY,
@@ -121,7 +120,6 @@ def get_token_from_session(sid: str):
         return None
     token, expires = r
     if int(time.time()) > expires:
-        # session expired - delete
         conn = sqlite3.connect(DB)
         c = conn.cursor()
         c.execute("DELETE FROM sessions WHERE sid=?", (sid,))
@@ -139,10 +137,9 @@ def delete_session(sid: str):
 
 # ----------------- ROUTES -----------------
 
-# health check
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse("<h3>Server attivo. Usa /admin/list per vedere le banche (locale).</h3>")
+    return HTMLResponse("<h3>Server attivo. Usa /admin?key=TUAPASSWORD per il pannello admin (sostituisci TUAPASSWORD)</h3>")
 
 # launch endpoint: scrivi questo sull'NFC, imposta cookie e reindirizza a /card
 @app.get("/launch/{token}", response_class=HTMLResponse)
@@ -153,7 +150,6 @@ def launch(token: str, request: Request):
 
     sid = create_session_for_token(token)
 
-    # pagina che scrive cookie e reindirizza a /card
     html = f"""
     <html>
       <head>
@@ -163,7 +159,6 @@ def launch(token: str, request: Request):
       </head>
       <body>
         <script>
-          // imposta cookie 'session' (max-age in secondi) e redirect a /card
           document.cookie = "session={sid}; path=/; max-age={SESSION_TTL}; samesite=lax";
           window.location.replace("/card");
         </script>
@@ -176,7 +171,6 @@ def launch(token: str, request: Request):
 # card without token: legge cookie session e mostra pagina equivalente
 @app.get("/card", response_class=HTMLResponse)
 def card_from_session(request: Request):
-    # read cookie 'session'
     cookies = request.headers.get("cookie", "")
     sid = None
     for part in cookies.split(";"):
@@ -191,18 +185,15 @@ def card_from_session(request: Request):
     if not token:
         return HTMLResponse("<h3>Sessione scaduta o non valida. Riavvicina la carta NFC.</h3>", status_code=403)
 
-    # delegate to token-based view
-    # create a fake Request object? simpler: call the token handler logic by reusing helper functions
     site = get_by_token(token)
     if not site:
         return HTMLResponse("<h3>Token non valido.</h3>", status_code=404)
 
-    # fingerprint check
     fp = fingerprint_from_request(request)
     if site['bound_fingerprint'] and site['bound_fingerprint'] != fp:
         return HTMLResponse("<h3>Accesso non autorizzato</h3><p>Questa carta è associata a un altro dispositivo.</p>", status_code=403)
 
-    # show PIN form (same as /card/{token})
+    # show PIN form
     return f"""
     <html>
     <head>
@@ -232,7 +223,7 @@ def card_from_session(request: Request):
     </html>
     """
 
-# legacy token endpoint (kept for debug/compatibility) - still works if someone opens it directly
+# legacy token endpoint (kept for compatibility)
 @app.get("/card/{token}", response_class=HTMLResponse)
 def card_get(token: str, request: Request):
     site = get_by_token(token)
@@ -283,7 +274,6 @@ def unlock(request: Request, token: str = Form(...), pin: str = Form(...)):
         return HTMLResponse("<h3>PIN errato.</h3><p><a href='/card/{0}'>Riprova</a></p>".format(token), status_code=403)
 
     fp = fingerprint_from_request(request)
-    # bind on first use
     if not site['bound_fingerprint']:
         bind_fingerprint(token, fp)
         site = get_by_token(token)
@@ -360,25 +350,63 @@ def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(
 
     return HTMLResponse(f"<h3>Trasferimento di {amount:.2f}€ a {to_name} effettuato.</h3><p><a href='/card'>Torna</a></p>")
 
-# admin endpoints (list & reset)
-@app.get("/admin/list", response_class=HTMLResponse)
-def admin_list():
+# admin endpoints (protected by ADMIN_KEY)
+@app.get("/admin", response_class=HTMLResponse)
+def admin_list(key: str = ""):
+    if key != ADMIN_KEY:
+        return HTMLResponse("<h3>❌ Accesso negato</h3>", status_code=403)
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     c.execute("SELECT name, token, balance, bound_fingerprint FROM cards")
     rows = c.fetchall()
     conn.close()
-    html = "<h2>Lista siti</h2><ul>"
-    for r in rows:
-        bound = (r[3][:8] + "...") if r[3] else "nessuno"
-        html += f"<li><b>{r[0]}</b> — saldo: {r[2]:.2f} — token: {r[1]} — bound: {bound} — <a href='/admin/reset/{r[1]}'>Reset binding</a></li>"
-    html += "</ul>"
+    html = """
+    <html>
+    <head>
+      <meta charset='utf-8'>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Admin - Banche</title>
+      <style>
+        body { font-family: Arial; padding:20px; background:#f4f6fb; }
+        table { border-collapse: collapse; width:100%; background:white; border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(20,30,50,0.06); }
+        th, td { border-bottom:1px solid #eee; padding:10px 12px; text-align:left; }
+        th { background:#0b63ff; color:white; }
+        a.button { display:inline-block; padding:6px 10px; background:#0b63ff; color:white; border-radius:6px; text-decoration:none; font-size:14px; }
+      </style>
+    </head>
+    <body>
+      <h2>🏦 Pannello Admin</h2>
+      <table>
+        <tr><th>Nome</th><th>Token</th><th>Saldo</th><th>Bound</th><th>Azioni</th></tr>
+    """
+    for name, token, balance, bound in rows:
+        bound_disp = (bound[:8] + "...") if bound else "nessuno"
+        html += f"<tr><td>{name}</td><td>{token}</td><td>{balance:.2f}€</td><td>{bound_disp}</td>"
+        html += f"<td><a class='button' href='/admin/reset/{token}?key={ADMIN_KEY}'>Reset binding</a> "
+        html += f"<a class='button' href='/admin/delete/{token}?key={ADMIN_KEY}'>Elimina</a></td></tr>"
+    html += "</table></body></html>"
     return HTMLResponse(html)
 
 @app.get("/admin/reset/{token}", response_class=HTMLResponse)
-def admin_reset(token: str):
+def admin_reset(token: str, key: str = ""):
+    if key != ADMIN_KEY:
+        return HTMLResponse("<h3>❌ Accesso negato</h3>", status_code=403)
     site = get_by_token(token)
     if not site:
         return HTMLResponse("<h3>Token non trovato.</h3>", status_code=404)
     clear_binding(token)
-    return HTMLResponse(f"<h3>Binding resettato per {site['name']}.</h3><p><a href='/admin/list'>Torna alla lista</a></p>")
+    return HTMLResponse(f"<h3>Binding resettato per {site['name']}.</h3><p><a href='/admin?key={ADMIN_KEY}'>Torna alla lista</a></p>")
+
+@app.get("/admin/delete/{token}", response_class=HTMLResponse)
+def admin_delete(token: str, key: str = ""):
+    if key != ADMIN_KEY:
+        return HTMLResponse("<h3>❌ Accesso negato</h3>", status_code=403)
+    site = get_by_token(token)
+    if not site:
+        return HTMLResponse("<h3>Token non trovato.</h3>", status_code=404)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("DELETE FROM cards WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+    return HTMLResponse(f"<h3>Eliminata {site['name']}.</h3><p><a href='/admin?key={ADMIN_KEY}'>Torna alla lista</a></p>")
