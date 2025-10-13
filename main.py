@@ -8,10 +8,10 @@ import sqlite3, secrets, hashlib, time, html as html_lib
 
 # ---------- CONFIG ----------
 DB_FILE = "cards.db"
-SESSION_TTL = 60 * 5  # 5 minuti
+SESSION_TTL = 60 * 5  # 5 minuti sessione corta
 DEVICE_COOKIE_NAME = "device_id"
 SESSION_COOKIE_NAME = "session"
-ADMIN_KEY = "bunald"
+ADMIN_KEY = "bunald"  # CAMBIA questa stringa prima del deploy
 
 app = FastAPI()
 
@@ -150,7 +150,7 @@ def delete_session(sid: str):
 # ---------- UTIL ----------
 def ensure_device_cookie(response: Response, request: Request) -> str:
     """
-    Return device_id from cookie if present; otherwise create one and set cookie.
+    Return device_id from cookie if present; otherwise create one and set cookie on response.
     """
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if not device_id:
@@ -163,7 +163,45 @@ def ensure_device_cookie(response: Response, request: Request) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse("<h3>Server attivo — usa /admin/list?key=LA_TUA_CHIAVE per gestire</h3>")
+    return HTMLResponse("""
+    <h3>Server attivo — usa /create?name=NomeBanca&code=PIN&initial=50 per creare una banca</h3>
+    <p>Admin: /admin/list?key=LA_TUA_CHIAVE</p>
+    """)
+
+# ---- Creation via link: /create?name=&code=&initial=
+# code = PIN (salvato hashed)
+@app.get("/create", response_class=HTMLResponse)
+def create_via_link(name: str = "", code: str = "", initial: float = 0.0, key: str = ""):
+    # Optional: protect creation with admin key if you want; here we allow creation without key
+    # If you want to require the admin key, uncomment the following:
+    # if key != ADMIN_KEY:
+    #     return HTMLResponse("<h3>Creazione bloccata: chiave admin richiesta</h3>", status_code=403)
+
+    if not name or not code:
+        return HTMLResponse("<h3>Parametri mancanti. Usa ?name=...&code=...&initial=...</h3>", status_code=400)
+
+    # limit: max 5
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM cards")
+    count = c.fetchone()[0]
+    conn.close()
+    if count >= 5:
+        return HTMLResponse("<h3>Hai già raggiunto il limite di 5 banche.</h3>", status_code=400)
+
+    token = create_site(name, code, initial)
+    if not token:
+        return HTMLResponse("<h3>Errore: esiste già una banca con quel nome.</h3>", status_code=400)
+
+    # Return the URL to write on the NFC tag (the token is shown only here for admin's convenience)
+    url = f"/launch/{token}"
+    return HTMLResponse(f"""
+    <h3>✅ Banca '{html_lib.escape(name)}' creata con successo!</h3>
+    <p>Saldo iniziale: {initial:.2f} €</p>
+    <p>URL da scrivere sul tag NFC (aggiungi il tuo dominio prima):</p>
+    <pre>https://TUO-DOMINIO{url}</pre>
+    <p>Puoi resettare il binding dopo averlo scritto: /admin/reset/&lt;token&gt;?key={html_lib.escape(ADMIN_KEY)}</p>
+    """)
 
 # LAUNCH: write this URL on the NFC tag: /launch/<token>
 # - one-time: marks token_used and creates a short session. also ensures device cookie exists.
@@ -183,7 +221,7 @@ def launch(token: str, request: Request, response: Response):
     sid = create_session_for_token(token)
     mark_token_used(token)
 
-    # set session cookie
+    # set session cookie (httponly)
     response.set_cookie(SESSION_COOKIE_NAME, sid, max_age=SESSION_TTL, samesite="Lax", httponly=True)
 
     # redirect to /card (token no longer visible)
@@ -198,9 +236,16 @@ def launch(token: str, request: Request, response: Response):
 
 # CARD: reads session cookie, shows PIN form. does not expose token.
 @app.get("/card", response_class=HTMLResponse)
-def card_from_session(request: Request):
+def card_from_session(request: Request, response: Response):
     sid = request.cookies.get(SESSION_COOKIE_NAME)
     if not sid:
+        # if session not present: ensure we still set a device cookie so future binds are stable
+        # create device cookie and inform user to re-scan the tag
+        dev = request.cookies.get(DEVICE_COOKIE_NAME)
+        if not dev:
+            new_dev = secrets.token_hex(16)
+            response.set_cookie(DEVICE_COOKIE_NAME, new_dev, max_age=60*60*24*365, samesite="Lax")
+            return HTMLResponse("<h3>Device cookie creato. Riprova avvicinando la carta NFC.</h3>", status_code=403)
         return HTMLResponse("<h3>Sessione non trovata. Avvicina la carta NFC.</h3>", status_code=403)
 
     token = get_token_from_session(sid)
@@ -251,14 +296,12 @@ def unlock(request: Request, response: Response, token: str = Form(...), pin: st
     if site["pin_hash"] != hash_pin(pin):
         return HTMLResponse("<h3>PIN errato.</h3><p><a href='/card'>Riprova</a></p>", status_code=403)
 
-    # Ensure device cookie exists (should have been created on launch)
+    # Ensure device cookie exists (should have been created on launch, but double-check)
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if not device_id:
-        # If missing, create one and ask user to retry (rare, but safe)
+        # create one now and set cookie, then ask user to retry (rare case)
         new_device_id = secrets.token_hex(16)
-        # set cookie and ask to retry
-        resp_html = "<h3>Device cookie creato, riavvicina la carta o ricarica la pagina.</h3>"
-        r = HTMLResponse(resp_html)
+        r = HTMLResponse("<h3>Device cookie creato, ricarica la pagina o riavvicina la carta</h3>")
         r.set_cookie(DEVICE_COOKIE_NAME, new_device_id, max_age=60*60*24*365, samesite="Lax")
         return r
 
@@ -427,7 +470,8 @@ def admin_delete(token: str, key: str = ""):
 
 # ---------- NOTES ----------
 # - Cambia ADMIN_KEY prima del deploy.
-# - Per creare carte: /admin/create?name=Nome&pin=1234&initial=50&key=LA_TUA_CHIAVE
+# - Per creare carte via link (senza shell):
+#   https://TUO-DOMINIO/create?name=NomeBanca&code=2127&initial=50
 # - Scrivi l'URL mostrato sulla carta NFC: https://TUO-DOMINIO/launch/<token>
 # - Procedura d'uso:
 #   1) Avvicina la carta (launch) -> browser riceve session cookie + device cookie
@@ -435,7 +479,7 @@ def admin_delete(token: str, key: str = ""):
 #   3) Dopo il primo uso solo il dispositivo con lo stesso cookie potrà usare la carta
 # - Per resettare binding: /admin/reset/<token>?key=LA_TUA_CHIAVE
 #
-# Limiti:
-# - Device cookie è persistente ma può essere cancellato dall'utente o cambiando browser;
-# - Se qualcuno copia l'NDEF PRIMA del primo utilizzo, può usare l'URL: evita di condividere i tag;
-# - Per maggiore sicurezza usare PIN hash più robusto (bcrypt) e HTTPS (Render fornisce TLS).
+# Limiti e avvertenze:
+# - Il device cookie può essere cancellato dall'utente o se si cambia browser; in quel caso bisogna resettare binding o ricreare la carta.
+# - Se qualcuno copia l'NDEF PRIMA del primo utilizzo, potrà usare l'URL finché il token non viene usato; evita di condividere i tag.
+# - Per maggiore sicurezza utilizzare bcrypt per PIN e HTTPS (Render fornisce TLS).
