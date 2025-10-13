@@ -8,6 +8,51 @@ SESSION_TTL = 60 * 5  # durata sessione in secondi (5 minuti)
 ADMIN_KEY = "bunald1"  # <-- CAMBIALA!
 
 app = FastAPI()
+# --- Endpoint per creare una banca da remoto (protetto da ADMIN_KEY) ---
+@app.get("/admin/create", response_class=HTMLResponse)
+def admin_create(name: str = "", pin: str = "", initial: float = 100.0, key: str = ""):
+    # Controllo chiave admin
+    if key != ADMIN_KEY:
+        return HTMLResponse("<h3>❌ Accesso negato (chiave errata)</h3>", status_code=403)
+
+    # Controlli basilari
+    name = name.strip()
+    pin = str(pin).strip()
+    try:
+        initial = float(initial)
+    except:
+        initial = 100.0
+
+    if not name or not pin:
+        return HTMLResponse("<h3>Errore: fornire 'name' e 'pin' nella query string</h3>", status_code=400)
+
+    # Limite di 5 siti (opzionale) - verifica quante banche ci sono già
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM cards")
+    count = c.fetchone()[0]
+    conn.close()
+    if count >= 5:
+        return HTMLResponse("<h3>Hai già raggiunto il limite di 5 siti.</h3>", status_code=400)
+
+    # Crea la banca (usa la funzione già presente)
+    token = create_site_in_db(name, pin, initial)
+    if not token:
+        return HTMLResponse("<h3>Errore: nome già esistente o problema creazione.</h3>", status_code=400)
+
+    # Risposta con token completo (URL da scrivere nel tag NFC)
+    full_url = f"/launch/{token}"
+    html = f"""
+    <html><body style='font-family:Arial;padding:20px;'>
+      <h3>✅ Banca creata: {name}</h3>
+      <p>Saldo iniziale: {initial:.2f}€</p>
+      <p>Token: <code>{token}</code></p>
+      <p>URL da scrivere sul tag NFC (aggiungi il dominio prima):</p>
+      <pre>https://TUO-DOMINIO{full_url}</pre>
+      <p><b>IMPORTANTE:</b> copia subito il token e usalo per scrivere il tag.</p>
+    </body></html>
+    """
+    return HTMLResponse(html)
 
 # ----------------- DB init -----------------
 def init_db():
