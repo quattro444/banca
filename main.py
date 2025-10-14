@@ -832,14 +832,14 @@ def admin_panel(request: Request, key: str = ""):
       </table>
 
       <script>
-      function copyText(t) {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(t).then(() => { alert('Copiato negli appunti'); })
-            .catch(() => { window.prompt('Copia manualmente:', t); });
-        } else {
+      function copyText(t) {{
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(t).then(() => {{ alert('Copiato negli appunti'); }})
+            .catch(() => {{ window.prompt('Copia manualmente:', t); }});
+        }} else {{
           window.prompt('Copia manualmente:', t);
-        }
-      }
+        }}
+      }}
       </script>
     """
     return render_page(inner, "Admin")
