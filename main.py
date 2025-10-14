@@ -39,6 +39,20 @@ def init_db():
             expires INTEGER
         )
     """)
+    # Log transazioni (storico motivazioni)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            from_token TEXT,
+            from_name TEXT,
+            to_token TEXT,
+            to_name TEXT,
+            amount REAL NOT NULL,
+            reason TEXT
+        )
+    """)
+
     # Migrazione: created_at su sessions
     try:
         cols = c.execute("PRAGMA table_info(sessions)").fetchall()
@@ -152,6 +166,38 @@ def adjust_balance(token: str, delta: float):
     c.execute("UPDATE cards SET balance = balance + ? WHERE token = ?", (float(delta), token))
     conn.commit()
     conn.close()
+
+# Transazioni
+def log_transaction(from_token: str, from_name: str, to_token: str, to_name: str, amount: float, reason: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO transactions (ts, from_token, from_name, to_token, to_name, amount, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(time.time()), from_token, from_name, to_token, to_name, float(amount), reason)
+    )
+    conn.commit()
+    conn.close()
+
+def get_recent_transactions(token: str, limit: int = 10):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        f"""SELECT ts, from_name, to_name, amount, reason
+            FROM transactions
+            WHERE from_token = ? OR to_token = ?
+            ORDER BY ts DESC
+            LIMIT {int(limit)}""",
+        (token, token)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [{"ts": r[0], "from_name": r[1], "to_name": r[2], "amount": r[3], "reason": r[4]} for r in rows]
+
+def fmt_ts(ts: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return str(ts)
 
 # Settings helpers
 def get_settings():
@@ -273,11 +319,12 @@ def render_page(inner_html: str, title: str = "") -> HTMLResponse:
         .btn.success {{ background:#10b981; color:white; }}
         .grid {{ display:grid; gap:12px; }}
         @media(min-width:720px){{ .grid.cols-2 {{ grid-template-columns:1fr 1fr; }} .grid.cols-3 {{ grid-template-columns:1fr 1fr 1fr; }} }}
-        input, select {{ width:100%; padding:10px; border-radius:10px; border:1px solid #e2e8f0; box-sizing:border-box; }}
+        input, select, textarea {{ width:100%; padding:10px; border-radius:10px; border:1px solid #e2e8f0; box-sizing:border-box; }}
         table {{ width:100%; border-collapse:collapse; }}
-        th, td {{ padding:10px; border-bottom:1px solid #e2e8f0; text-align:left; }}
+        th, td {{ padding:10px; border-bottom:1px solid #e2e8f0; text-align:left; vertical-align:top; }}
         .muted {{ color:#475569; font-size:13px; }}
         .pill {{ display:inline-block; padding:2px 8px; border-radius:999px; background:#e2e8f0; color:#334155; font-size:12px; }}
+        .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
       </style>
     </head>
     <body>
@@ -351,7 +398,7 @@ def create_via_link(name: str = "", code: str = "", initial: float = 0.0, desc: 
       <h3>✅ Carta '{html_lib.escape(name)}' creata</h3>
       <p>Saldo iniziale: {fmt_bonsaura(initial)}</p>
       <p>URL da scrivere sul tag NFC:</p>
-      <pre>{html_lib.escape(url)}</pre>
+      <pre class="mono">{html_lib.escape(url)}</pre>
     """
     return render_page(inner, "Carta creata")
 
@@ -406,7 +453,7 @@ def card_from_session(request: Request):
     """
     return render_page(inner, site["name"])
 
-# UNLOCK: verifica PIN; se primo accesso binda device_id; poi mostra saldo/transfer
+# UNLOCK: verifica PIN; se primo accesso binda device_id; poi mostra saldo/transfer + storico
 @app.post("/unlock", response_class=HTMLResponse)
 def unlock(request: Request, token: str = Form(...), pin: str = Form(...)):
     site = get_by_token(token)
@@ -423,33 +470,58 @@ def unlock(request: Request, token: str = Form(...), pin: str = Form(...)):
         site = get_by_token(token)
     if site["bound_device_id"] != device_id:
         return render_page("<h3>Accesso non autorizzato: dispositivo non registrato.</h3>", "Bloccato")
+
+    recent = get_recent_transactions(site["token"], limit=10)
+    rows_html = "".join(
+        f"<tr><td>{fmt_ts(t['ts'])}</td><td>{html_lib.escape(t['from_name'] or '-')}</td>"
+        f"<td>{html_lib.escape(t['to_name'] or '-')}</td><td>{fmt_bonsaura(t['amount'])}</td>"
+        f"<td>{html_lib.escape(t['reason'] or '')}</td></tr>"
+        for t in recent
+    ) or '<tr><td colspan="5" class="muted">Nessuna transazione</td></tr>'
+
     inner = f"""
       <h2>{html_lib.escape(site["name"])}</h2>
       <p><strong>Saldo:</strong> {fmt_bonsaura(site["balance"])}</p>
       <p class="muted">{html_lib.escape(site.get("description") or "")}</p>
+
       <h4>Invia denaro</h4>
       <form method="post" action="/transfer">
         <input type="hidden" name="from_token" value="{html_lib.escape(site['token'])}">
         <input name="to_name" placeholder="Nome carta destinatario" required><br>
         <input name="amount" type="number" step="0.01" placeholder="Importo in Bonsaura" required><br>
+        <textarea name="reason" rows="2" placeholder="Motivazione (obbligatoria)" required></textarea><br>
         <button class="btn primary" type="submit">Invia</button>
       </form>
-      <p class="muted">Carta associata a questo dispositivo. Per spostarla usa il reset binding in Admin.</p>
+
+      <h4 style="margin-top:16px">Ultime operazioni</h4>
+      <table>
+        <thead><tr><th>Data</th><th>Da</th><th>A</th><th>Importo</th><th>Motivazione</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+
+      <p class="muted">Il destinatario potrà vedere mittente e motivazione quando apre la propria carta.</p>
     """
     return render_page(inner, site["name"])
 
-# TRANSFER: solo se la carta mittente è bindata a questo device
+# TRANSFER: solo se la carta mittente è bindata a questo device + motivazione obbligatoria
 @app.post("/transfer", response_class=HTMLResponse)
-def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(...), amount: str = Form(...)):
+def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(...), amount: str = Form(...), reason: str = Form(...)):
     from_site = get_by_token(from_token)
     if not from_site:
         return render_page("<h3>Mittente non trovato.</h3>", "Errore")
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if not from_site["bound_device_id"] or from_site["bound_device_id"] != device_id:
         return render_page("<h3>Accesso non autorizzato per trasferimento.</h3>", "Bloccato")
+
     to_name = to_name.strip()
     if to_name == "":
         return render_page("<h3>Nome destinatario non valido.</h3>", "Errore")
+    reason = (reason or "").strip()
+    if not reason:
+        return render_page("<h3>Motivazione obbligatoria.</h3>", "Errore")
+    if len(reason) > 300:
+        return render_page("<h3>Motivazione troppo lunga (max 300 caratteri).</h3>", "Errore")
+
     try:
         amt = float(amount)
     except Exception:
@@ -458,6 +530,7 @@ def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(
         return render_page("<h3>Importo deve essere positivo.</h3>", "Errore")
     if from_site["balance"] < amt:
         return render_page(f"<h3>Saldo insufficiente. Hai {fmt_bonsaura(from_site['balance'])}</h3>", "Errore")
+
     dest = get_by_name(to_name)
     if not dest:
         new_token = secrets.token_urlsafe(12)
@@ -467,9 +540,18 @@ def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(
                   (to_name, new_token, hash_pin("0000"), 0.0, ""))
         conn.commit(); conn.close()
         dest = get_by_name(to_name)
+
     update_balance_by_token(from_site["token"], from_site["balance"] - amt)
     update_balance_by_token(dest["token"], dest["balance"] + amt)
-    return render_page(f"<h3>Trasferimento di {fmt_bonsaura(amt)} a {html_lib.escape(to_name)} effettuato.</h3><p><a href='/card'>Torna</a></p>", "OK")
+    # Log transazione con motivazione e mittente/destinatario
+    log_transaction(from_site["token"], from_site["name"], dest["token"], dest["name"], amt, reason)
+
+    return render_page(
+        f"<h3>Trasferimento di {fmt_bonsaura(amt)} a {html_lib.escape(to_name)} effettuato.</h3>"
+        f"<p>Motivazione: {html_lib.escape(reason)}</p>"
+        f"<p><a href='/card'>Torna</a></p>",
+        "OK"
+    )
 
 # ---------- ADMIN / LISTA ----------
 def require_key(key: str) -> bool:
@@ -525,7 +607,7 @@ def admin_panel(request: Request, key: str = ""):
           <tr>
             <td>
               {html_lib.escape(name)}<br>
-              <span class="muted">token:</span> <code>{token_html}</code><br>
+              <span class="muted">token:</span> <code class="mono">{token_html}</code><br>
               <div style="display:flex;gap:6px;margin-top:6px">
                 <button class="btn" type="button" onclick="copyText('{token_html}')">Copia token</button>
                 <button class="btn secondary" type="button" onclick="copyText('{url_nfc}')">Copia URL NFC</button>
@@ -568,6 +650,7 @@ def admin_panel(request: Request, key: str = ""):
             <input name="desc" placeholder="Descrizione (opzionale)">
             <button class="btn primary" type="submit">Crea</button>
           </form>
+          <p class="muted">L’URL NFC sarà /launch/&lt;token&gt; (vedi logs/DB).</p>
         </div>
         <div>
           <h3>Personalizzazione sito</h3>
@@ -673,5 +756,6 @@ def admin_list(key: str = ""):
 # ---------- NOTE ----------
 # - Le pagine carta si aprono solo subito dopo un tap NFC: /card richiede una sessione creata da /launch negli ultimi SCAN_WINDOW secondi.
 # - Valuta visualizzata come "Bonsaura".
-# - Home con pannello Admin/Lista (entrambe protette da key).
-# - Personalizzazione aspetto: logo, gradiente, font (Google Fonts).
+# - Motivazione obbligatoria nei trasferimenti + storico transazioni visibile dopo l'accesso alla carta.
+# - Home con pannello Admin/Lista (protette da key). Personalizzazione: logo, gradiente, font (Google Fonts).
+    
