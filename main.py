@@ -506,42 +506,55 @@ def lista(key: str = ""):
     return render_page(inner, "Lista carte")
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_panel(key: str = ""):
-    if not require_key(key):
+def admin_panel(request: Request, key: str = ""):
+    if key != ADMIN_KEY:
         return render_page("<h3>Accesso negato</h3>", "403")
     s = get_settings()
+    base = str(request.base_url).rstrip("/")
+
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
     rows = c.execute("SELECT name, token, balance, bound_device_id, description FROM cards ORDER BY id").fetchall()
     conn.close()
+
     cards_html = ""
     for name, token, balance, bound, desc in rows:
         bind_state = "associata" if bound else "libera"
+        token_html = html_lib.escape(token)
+        url_nfc = html_lib.escape(f"{base}/launch/{token}")
         cards_html += f"""
           <tr>
-            <td>{html_lib.escape(name)}<br><span class="muted">token: {html_lib.escape(token[:8])}...</span></td>
+            <td>
+              {html_lib.escape(name)}<br>
+              <span class="muted">token:</span> <code>{token_html}</code><br>
+              <div style="display:flex;gap:6px;margin-top:6px">
+                <button class="btn" type="button" onclick="copyText('{token_html}')">Copia token</button>
+                <button class="btn secondary" type="button" onclick="copyText('{url_nfc}')">Copia URL NFC</button>
+              </div>
+            </td>
             <td>{fmt_bonsaura(balance)}</td>
             <td><span class="pill">{bind_state}</span></td>
             <td>{html_lib.escape(desc or '')}</td>
             <td style="min-width:280px">
               <form style="display:inline-block" method="post" action="/admin/adjust">
                 <input type="hidden" name="key" value="{html_lib.escape(key)}">
-                <input type="hidden" name="token" value="{html_lib.escape(token)}">
+                <input type="hidden" name="token" value="{token_html}">
                 <input name="delta" type="number" step="0.01" placeholder="+/- Bonsaura" required style="width:130px">
                 <button class="btn success" type="submit">Applica</button>
               </form>
               <form style="display:inline-block" method="post" action="/admin/reset">
                 <input type="hidden" name="key" value="{html_lib.escape(key)}">
-                <input type="hidden" name="token" value="{html_lib.escape(token)}">
+                <input type="hidden" name="token" value="{token_html}">
                 <button class="btn secondary" type="submit">Reset binding</button>
               </form>
               <form style="display:inline-block" method="post" action="/admin/delete">
                 <input type="hidden" name="key" value="{html_lib.escape(key)}">
-                <input type="hidden" name="token" value="{html_lib.escape(token)}">
+                <input type="hidden" name="token" value="{token_html}">
                 <button class="btn danger" type="submit" onclick="return confirm('Eliminare la carta?')">Elimina</button>
               </form>
             </td>
           </tr>
         """
+
     inner = f"""
       <h2>Admin</h2>
       <div class="grid cols-2">
@@ -555,7 +568,6 @@ def admin_panel(key: str = ""):
             <input name="desc" placeholder="Descrizione (opzionale)">
             <button class="btn primary" type="submit">Crea</button>
           </form>
-          <p class="muted">L’URL NFC sarà /launch/&lt;token&gt; (vedi logs/DB).</p>
         </div>
         <div>
           <h3>Personalizzazione sito</h3>
@@ -568,15 +580,25 @@ def admin_panel(key: str = ""):
             <input name="font_name" placeholder="Font (Google Fonts)" value="{html_lib.escape(s['font_name'])}">
             <button class="btn primary" type="submit">Salva stile</button>
           </form>
-          <p class="muted">Esempi font: Poppins, Inter, Rubik, Outfit…</p>
         </div>
       </div>
 
       <h3>Carte</h3>
       <table>
-        <thead><tr><th>Nome</th><th>Saldo</th><th>Binding</th><th>Descrizione</th><th>Azioni</th></tr></thead>
+        <thead><tr><th>Nome/Token</th><th>Saldo</th><th>Binding</th><th>Descrizione</th><th>Azioni</th></tr></thead>
         <tbody>{cards_html or '<tr><td colspan="5" class="muted">Nessuna carta</td></tr>'}</tbody>
       </table>
+
+      <script>
+      function copyText(t) {{
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(t).then(() => {{ alert('Copiato negli appunti'); }})
+            .catch(() => {{ window.prompt('Copia manualmente:', t); }});
+        }} else {{
+          window.prompt('Copia manualmente:', t);
+        }}
+      }}
+      </script>
     """
     return render_page(inner, "Admin")
 
