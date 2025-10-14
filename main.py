@@ -2,13 +2,13 @@
 # Requisiti: fastapi, uvicorn, python-multipart
 # pip install fastapi uvicorn python-multipart
 
-from fastapi import FastAPI, Request, Form, Response
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 import sqlite3, secrets, hashlib, time, html as html_lib
 
 # ---------- CONFIG ----------
 DB_FILE = "cards.db"
-SESSION_TTL = 60 * 5  # 5 minuti sessione corta
+SESSION_TTL = 60 * 5  # 5 minuti sessione corta 
 DEVICE_COOKIE_NAME = "device_id"
 SESSION_COOKIE_NAME = "session"
 ADMIN_KEY = "bunald"  # CAMBIA questa stringa prima del deploy
@@ -147,17 +147,23 @@ def delete_session(sid: str):
     conn.commit()
     conn.close()
 
-# ---------- UTIL ----------
-def ensure_device_cookie(response: Response, request: Request) -> str:
-    """
-    Return device_id from cookie if present; otherwise create one and set cookie on response.
-    """
-    device_id = request.cookies.get(DEVICE_COOKIE_NAME)
-    if not device_id:
-        device_id = secrets.token_hex(16)
-        # persist cookie long time (1 year)
-        response.set_cookie(DEVICE_COOKIE_NAME, device_id, max_age=60*60*24*365, samesite="Lax")
-    return device_id
+# ---------- COOKIE UTILS ----------
+def is_https(request: Request) -> bool:
+    # Rileva https anche dietro proxy (se passa X-Forwarded-Proto)
+    xf = request.headers.get("x-forwarded-proto", "")
+    return (request.url.scheme == "https") or ("https" in xf)
+
+def set_cookie(resp, name, value, max_age=None, httponly=False, request: Request = None):
+    secure = is_https(request) if request is not None else False
+    resp.set_cookie(
+        name,
+        value,
+        max_age=max_age,
+        samesite="Lax",
+        httponly=httponly,
+        secure=secure,
+        path="/",
+    )
 
 # ---------- ROUTES ----------
 
@@ -169,14 +175,8 @@ def home():
     """)
 
 # ---- Creation via link: /create?name=&code=&initial=
-# code = PIN (salvato hashed)
 @app.get("/create", response_class=HTMLResponse)
-def create_via_link(name: str = "", code: str = "", initial: float = 0.0, key: str = ""):
-    # Optional: protect creation with admin key if you want; here we allow creation without key
-    # If you want to require the admin key, uncomment the following:
-    # if key != ADMIN_KEY:
-    #     return HTMLResponse("<h3>Creazione bloccata: chiave admin richiesta</h3>", status_code=403)
-
+def create_via_link(name: str = "", code: str = "", initial: float = 0.0, key: str = "", request: Request = None):
     if not name or not code:
         return HTMLResponse("<h3>Parametri mancanti. Usa ?name=...&code=...&initial=...</h3>", status_code=400)
 
@@ -193,61 +193,59 @@ def create_via_link(name: str = "", code: str = "", initial: float = 0.0, key: s
     if not token:
         return HTMLResponse("<h3>Errore: esiste già una banca con quel nome.</h3>", status_code=400)
 
-    # Return the URL to write on the NFC tag (the token is shown only here for admin's convenience)
-    url = f"/launch/{token}"
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/launch/{token}"
     return HTMLResponse(f"""
     <h3>✅ Banca '{html_lib.escape(name)}' creata con successo!</h3>
     <p>Saldo iniziale: {initial:.2f} €</p>
-    <p>URL da scrivere sul tag NFC (aggiungi il tuo dominio prima):</p>
-    <pre>https://TUO-DOMINIO{url}</pre>
-    <p>Puoi resettare il binding dopo averlo scritto: /admin/reset/&lt;token&gt;?key={html_lib.escape(ADMIN_KEY)}</p>
+    <p>URL da scrivere sul tag NFC:</p>
+    <pre>{html_lib.escape(url)}</pre>
+    <p>Per resettare binding: /admin/reset/&lt;token&gt;?key={html_lib.escape(ADMIN_KEY)}</p>
     """)
 
-# LAUNCH: write this URL on the NFC tag: /launch/<token>
-# - one-time: marks token_used and creates a short session. also ensures device cookie exists.
-@app.get("/launch/{token}", response_class=HTMLResponse)
-def launch(token: str, request: Request, response: Response):
+# LAUNCH: URL da scrivere sul tag: /launch/<token>
+# - Se carta già bindata e device non coincide => blocco immediato
+# - Altrimenti crea sessione breve e redirige a /card
+@app.get("/launch/{token}")
+@app.head("/launch/{token}")
+def launch(token: str, request: Request):
     site = get_by_token(token)
     if not site:
         return HTMLResponse("<h3>Tag non valido.</h3>", status_code=404)
 
-    # Se è già bindato a qualche device e vuoi impedirne riuso via launch,
-    # puoi opzionalmente bloccare qui. Ma per il binding iniziale NON blocchiamo.
-    # if site["token_used"]:
-    #     return HTMLResponse("<h3>Tag già usato...</h3>", status_code=403)
+    device_id = request.cookies.get(DEVICE_COOKIE_NAME)
 
-    # Ensure device cookie present (so device can be bound later reliably)
-    device_id = ensure_device_cookie(response, request)
+    # Carta già associata a dispositivo diverso? Blocca subito (niente sessione)
+    if site["bound_device_id"] and (not device_id or site["bound_device_id"] != device_id):
+        return HTMLResponse(
+            "<h3>Accesso non autorizzato</h3><p>Questa carta è associata ad un altro dispositivo.</p>",
+            status_code=403
+        )
 
-    # Create short session but DO NOT mark token as used yet — lo facciamo solo dopo l'unlock.
+    # Prepara redirect a /card, imposta i cookie su questa response
+    resp = RedirectResponse(url="/card", status_code=302)
+
+    # Assicura un device cookie persistente (se manca)
+    if not device_id:
+        device_id = secrets.token_hex(16)
+        set_cookie(resp, DEVICE_COOKIE_NAME, device_id, max_age=60*60*24*365, httponly=True, request=request)
+
+    # Crea sessione breve e setta session cookie HttpOnly
     sid = create_session_for_token(token)
+    set_cookie(resp, SESSION_COOKIE_NAME, sid, max_age=SESSION_TTL, httponly=True, request=request)
 
-    # set session cookie (httponly)
-    response.set_cookie(SESSION_COOKIE_NAME, sid, max_age=SESSION_TTL, samesite="Lax", httponly=True)
+    return resp
 
-    # redirect to /card (token no longer visible)
-    html = (
-        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Accesso</title></head><body>"
-        "<script>window.location.replace('/card');</script>"
-        "<noscript>Apri /card manualmente</noscript>"
-        "</body></html>"
-    )
-    return HTMLResponse(html)
-
-
-# CARD: reads session cookie, shows PIN form. does not expose token.
+# CARD: legge la sessione, mostra form PIN. Non espone il token.
 @app.get("/card", response_class=HTMLResponse)
-def card_from_session(request: Request, response: Response):
+def card_from_session(request: Request):
     sid = request.cookies.get(SESSION_COOKIE_NAME)
     if not sid:
-        # if session not present: ensure we still set a device cookie so future binds are stable
-        # create device cookie and inform user to re-scan the tag
-        dev = request.cookies.get(DEVICE_COOKIE_NAME)
-        if not dev:
-            new_dev = secrets.token_hex(16)
-            response.set_cookie(DEVICE_COOKIE_NAME, new_dev, max_age=60*60*24*365, samesite="Lax")
-            return HTMLResponse("<h3>Device cookie creato. Riprova avvicinando la carta NFC.</h3>", status_code=403)
+        # Prova a impostare device cookie se manca, così il prossimo /launch associa correttamente
+        if not request.cookies.get(DEVICE_COOKIE_NAME):
+            resp = HTMLResponse("<h3>Device cookie creato. Riprova avvicinando la carta NFC.</h3>", status_code=403)
+            set_cookie(resp, DEVICE_COOKIE_NAME, secrets.token_hex(16), max_age=60*60*24*365, httponly=True, request=request)
+            return resp
         return HTMLResponse("<h3>Sessione non trovata. Avvicina la carta NFC.</h3>", status_code=403)
 
     token = get_token_from_session(sid)
@@ -258,7 +256,7 @@ def card_from_session(request: Request, response: Response):
     if not site:
         return HTMLResponse("<h3>Tag non valido.</h3>", status_code=404)
 
-    # If already bound to a device and current device cookie differs => block
+    # Se già bindata e device diverso => blocco
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if site["bound_device_id"] and (not device_id or site["bound_device_id"] != device_id):
         return HTMLResponse("<h3>Accesso non autorizzato</h3><p>Questa carta è associata ad un altro dispositivo.</p>", status_code=403)
@@ -276,7 +274,7 @@ def card_from_session(request: Request, response: Response):
     </head><body>
       <div class="card">
         <h2>{name}</h2>
-        <p>Inserisci il PIN per sbloccare questa carta su questo dispositivo. Se è la prima volta questo dispositivo verrà associato.</p>
+        <p>Inserisci il PIN per sbloccare questa carta su questo dispositivo. Se è la prima volta il dispositivo verrà associato.</p>
         <form method="post" action="/unlock">
           <input type="hidden" name="token" value="{token}">
           <input name="pin" type="password" placeholder="PIN" required><br>
@@ -288,9 +286,9 @@ def card_from_session(request: Request, response: Response):
 
     return HTMLResponse(html)
 
-# UNLOCK: verify PIN; if first-time bind device_id; else enforce device match
+# UNLOCK: verifica PIN; se primo accesso binda device_id; poi mostra saldo/transfer
 @app.post("/unlock", response_class=HTMLResponse)
-def unlock(request: Request, response: Response, token: str = Form(...), pin: str = Form(...)):
+def unlock(request: Request, token: str = Form(...), pin: str = Form(...)):
     site = get_by_token(token)
     if not site:
         return HTMLResponse("<h3>Token non valido.</h3>", status_code=404)
@@ -298,27 +296,23 @@ def unlock(request: Request, response: Response, token: str = Form(...), pin: st
     if site["pin_hash"] != hash_pin(pin):
         return HTMLResponse("<h3>PIN errato.</h3><p><a href='/card'>Riprova</a></p>", status_code=403)
 
-    # Ensure device cookie exists (should have been created on launch, but double-check)
+    # Assicura device cookie
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if not device_id:
-        # create one now and set cookie, then ask user to retry (rare case)
-        new_device_id = secrets.token_hex(16)
         r = HTMLResponse("<h3>Device cookie creato, ricarica la pagina o riavvicina la carta</h3>")
-        r.set_cookie(DEVICE_COOKIE_NAME, new_device_id, max_age=60*60*24*365, samesite="Lax")
+        set_cookie(r, DEVICE_COOKIE_NAME, secrets.token_hex(16), max_age=60*60*24*365, httponly=True, request=request)
         return r
 
-    # If not yet bound -> bind now
+    # Primo binding
     if not site["bound_device_id"]:
         bind_device_id(token, device_id)
-        # **Ora che il bind è avvenuto con successo**, possiamo marcare il token come usato
         mark_token_used(token)
         site = get_by_token(token)
 
-    # If bound but doesn't match -> block
+    # Device non combacia
     if site["bound_device_id"] != device_id:
         return HTMLResponse("<h3>Accesso non autorizzato: dispositivo non registrato.</h3>", status_code=403)
 
-    # OK -> show balance and transfer form
     bal = float(site["balance"])
     html = """
     <!doctype html>
@@ -349,8 +343,7 @@ def unlock(request: Request, response: Response, token: str = Form(...), pin: st
 
     return HTMLResponse(html)
 
-
-# TRANSFER: checks that from_token is bound to this device (device cookie)
+# TRANSFER: solo se la carta mittente è bindata a questo device
 @app.post("/transfer", response_class=HTMLResponse)
 def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(...), amount: str = Form(...)):
     from_site = get_by_token(from_token)
@@ -378,7 +371,7 @@ def transfer(request: Request, from_token: str = Form(...), to_name: str = Form(
 
     dest = get_by_name(to_name)
     if not dest:
-        # create recipient with dummy pin "0000"
+        # crea destinatario con PIN "0000"
         new_token = secrets.token_urlsafe(12)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -405,7 +398,7 @@ def admin_list(key: str = ""):
     conn.close()
     html = "<h2>Lista carte</h2><ul>"
     for name, token, balance, bound, used in rows:
-        bound_display = (bound[:8] + "...") if bound else "nessuno"
+        bound_display = ((bound[:8] + "...") if bound else "nessuno")
         used_display = "sì" if used else "no"
         html += (
             "<li><b>{}</b> — saldo: {:.2f}€ — used: {} — bound: {} "
@@ -439,8 +432,8 @@ def admin_create(name: str = "", pin: str = "", initial: float = 0.0, key: str =
         return HTMLResponse("<h3>Errore: nome già esistente.</h3>", status_code=400)
 
     return HTMLResponse(
-        "<h3>✅ Creata: {}</h3><p>URL da scrivere sul tag NFC (metti il tuo dominio prima):<br>"
-        "<code>https://TUO-DOMINIO/launch/{}</code></p>".format(html_lib.escape(name), html_lib.escape(token))
+        "<h3>✅ Creata: {}</h3><p>URL da scrivere sul tag NFC:<br>"
+        "<code>/launch/{}</code> (aggiungi il tuo dominio davanti)</p>".format(html_lib.escape(name), html_lib.escape(token))
     )
 
 @app.get("/admin/reset/{token}", response_class=HTMLResponse)
@@ -451,7 +444,6 @@ def admin_reset(token: str, key: str = ""):
     if not site:
         return HTMLResponse("<h3>Token non trovato</h3>", status_code=404)
     unbind_device_id(token)
-    # re-enable token for reuse if desired
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE cards SET token_used = 0 WHERE token = ?", (token,))
@@ -475,16 +467,12 @@ def admin_delete(token: str, key: str = ""):
 
 # ---------- NOTES ----------
 # - Cambia ADMIN_KEY prima del deploy.
-# - Per creare carte via link (senza shell):
+# - Crea carte via link:
 #   https://TUO-DOMINIO/create?name=NomeBanca&code=2127&initial=50
-# - Scrivi l'URL mostrato sulla carta NFC: https://TUO-DOMINIO/launch/<token>
-# - Procedura d'uso:
-#   1) Avvicina la carta (launch) -> browser riceve session cookie + device cookie
-#   2) /card -> inserisci PIN -> bind device (first time) e accesso
-#   3) Dopo il primo uso solo il dispositivo con lo stesso cookie potrà usare la carta
-# - Per resettare binding: /admin/reset/<token>?key=LA_TUA_CHIAVE
-#
-# Limiti e avvertenze:
-# - Il device cookie può essere cancellato dall'utente o se si cambia browser; in quel caso bisogna resettare binding o ricreare la carta.
-# - Se qualcuno copia l'NDEF PRIMA del primo utilizzo, potrà usare l'URL finché il token non viene usato; evita di condividere i tag.
-# - Per maggiore sicurezza utilizzare bcrypt per PIN e HTTPS (Render fornisce TLS).
+# - Scrivi sul tag NFC: https://TUO-DOMINIO/launch/<token>
+# - Flusso:
+#   1) Scan (launch) -> cookie device persistente + sessione breve -> redirect /card
+#   2) /card -> inserisci PIN -> bind definitivo (carta ↔ device)
+#   3) In futuro, solo quel device (cookie) potrà usare la carta
+# - Reset binding: /admin/reset/<token>?key=LA_TUA_CHIAVE
+# - Usa HTTPS in produzione (cookie Secure auto-se impostato se dietro proxy/https).
