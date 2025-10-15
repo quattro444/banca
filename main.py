@@ -205,7 +205,6 @@ def log_transaction(from_token, from_name, to_token, to_name, amount, reason):
              (int(time.time()), from_token, from_name, to_token, to_name, float(amount), reason))
 
 def get_recent_transactions(token: str, limit: int = 10):
-    # embed limit (già sanificato come int)
     placeholder = "%s" if USE_PG else "?"
     conn = get_conn(); c = conn.cursor()
     c.execute(f"""
@@ -225,7 +224,7 @@ def fmt_ts(ts: int) -> str:
 def get_settings():
     r = exec_sql("SELECT bank_name,logo_url,gradient_from,gradient_to,font_name FROM settings WHERE id=1", fetch="one")
     if not r:
-        return {"bank_name":"Banca NFC","logo_url":"","gradient_from":"#0ea5e9","#gradient_to":"#8b5cf6","font_name":"Poppins"}
+        return {"bank_name":"Banca NFC","logo_url":"","gradient_from":"#0ea5e9","gradient_to":"#8b5cf6","font_name":"Poppins"}
     return {"bank_name": r[0] or "Banca NFC", "logo_url": r[1] or "", "gradient_from": r[2] or "#0ea5e9",
             "gradient_to": r[3] or "#8b5cf6", "font_name": r[4] or "Poppins"}
 
@@ -237,7 +236,7 @@ def update_settings(bank_name, logo_url, gradient_from, gradient_to, font_name):
 def create_session_for_token(token: str):
     sid = secrets.token_urlsafe(24)
     now = int(time.time())
-    exec_sql("INSERT INTO sessions (sid, token, expires, created_at) VALUES (?, ?, ?, ?)",
+    exec_sql("INSERT INTO sessions (sid, token, expires, created_at) VALUES (?, ?, ?, ?)"
              (sid, token, now + SESSION_TTL, now))
     return sid
 
@@ -287,7 +286,7 @@ def render_page(inner_html: str, title: str = "") -> HTMLResponse:
           text-decoration:none;color:#0f172a;background:#e2e8f0; }}
         .btn.primary {{ background:#0ea5e9;color:#fff; }} .btn.secondary {{ background:#64748b;color:#fff; }}
         .btn.danger {{ background:#ef4444;color:#fff; }} .btn.success {{ background:#10b981;color:#fff; }}
-        input,textarea {{ width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:10px;box-sizing:border-box;margin-top:6px;margin-bottom:8px; }}
+        input,select,textarea {{ width:100%;padding:10px;border:1px solid #e2e8f0;border-radius:10px;box-sizing:border-box;margin-top:6px;margin-bottom:8px; }}
         table {{ width:100%;border-collapse:collapse; }} th,td {{ padding:10px;border-bottom:1px solid #e2e8f0;text-align:left; }}
         .muted {{ color:#475569;font-size:13px; }} .pill {{ display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:12px; }}
         .mono {{ font-family:ui-monospace,Consolas,monospace; }} .grid {{ display:grid;gap:12px; }}
@@ -495,6 +494,18 @@ def bank(request: Request):
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if site["bound_device_id"] and site["bound_device_id"] != device_id:
         return render_page("<h3>Accesso non autorizzato</h3>", "Bloccato")
+
+    # Menu a tendina con banche disponibili (escludi se stesso)
+    dest_rows = exec_sql("SELECT name FROM cards WHERE token <> ? ORDER BY name", (site["token"]), fetch="all")
+    # psycopg2 richiede tupla per singolo parametro; garantiamolo:
+    if isinstance(dest_rows, type(None)):
+        dest_rows = []
+    if isinstance((site["token"]), str):
+        dest_rows = exec_sql("SELECT name FROM cards WHERE token <> ? ORDER BY name", (site["token"],), fetch="all") or []
+    options_html = "".join(
+        f"<option value=\"{html_lib.escape(n[0])}\">{html_lib.escape(n[0])}</option>" for n in dest_rows
+    )
+
     recent = get_recent_transactions(site["token"], limit=10)
     rows_html = "".join(
         f"<tr><td>{fmt_ts(t['ts'])}</td><td>{html_lib.escape(t['from_name'] or '-')}</td>"
@@ -502,18 +513,25 @@ def bank(request: Request):
         f"<td>{html_lib.escape(t['reason'] or '')}</td></tr>"
         for t in recent
     ) or '<tr><td colspan="5" class="muted">Nessuna transazione</td></tr>'
+
     inner = f"""
       <h2>{html_lib.escape(site['name'])}</h2>
       <p><strong>Saldo:</strong> {fmt_bonsaura(site['balance'])}</p>
       <p class="muted">{html_lib.escape(site.get('description') or '')}</p>
+
       <h4>Invia denaro</h4>
       <form method="post" action="/transfer">
         <input type="hidden" name="from_token" value="{html_lib.escape(site['token'])}">
-        <input name="to_name" placeholder="Nome carta destinatario" required>
+        <label>Banca destinataria</label>
+        <select name="to_name" required>
+          <option value="" disabled selected>Seleziona banca…</option>
+          {options_html}
+        </select>
         <input name="amount" type="number" step="0.01" placeholder="Importo" required>
         <textarea name="reason" rows="2" placeholder="Motivazione (obbligatoria)" required></textarea>
         <button class="btn primary" type="submit">Invia</button>
       </form>
+
       <h4 style="margin-top:16px">Ultime operazioni</h4>
       <table>
         <thead><tr><th>Data</th><th>Da</th><th>A</th><th>Importo</th><th>Motivazione</th></tr></thead>
@@ -533,21 +551,28 @@ def transfer(request: Request,
     device_id = request.cookies.get(DEVICE_COOKIE_NAME)
     if not from_site["bound_device_id"] or from_site["bound_device_id"] != device_id:
         return render_page("<h3>Accesso non autorizzato</h3>", "Bloccato")
-    to_name = to_name.strip()
-    if not to_name: return render_page("<h3>Nome destinatario non valido</h3>", "Errore")
+
+    to_name = (to_name or "").strip()
+    if not to_name:
+        return render_page("<h3>Seleziona una banca destinataria</h3>", "Errore")
+
     reason = (reason or "").strip()
     if not reason: return render_page("<h3>Motivazione obbligatoria</h3>", "Errore")
     if len(reason) > 300: return render_page("<h3>Motivazione troppo lunga</h3>", "Errore")
+
     try: amt = float(amount)
     except: return render_page("<h3>Importo non valido</h3>", "Errore")
     if amt <= 0: return render_page("<h3>Importo deve essere positivo</h3>", "Errore")
     if from_site["balance"] < amt:
         return render_page(f"<h3>Saldo insufficiente ({fmt_bonsaura(from_site['balance'])})</h3>", "Errore")
+
     dest = get_by_name(to_name)
     if not dest:
-        new_token = secrets.token_urlsafe(12)
-        create_site(to_name, "0000", 0.0, "")
-        dest = get_by_name(to_name)
+        return render_page(
+            f"<h3>Banca '{html_lib.escape(to_name)}' non trovata</h3>"
+            f"<p>Nessun punto inviato.</p>"
+            f"<p><a href='/bank'>Torna</a></p>", "Errore")
+
     update_balance_by_token(from_site["token"], from_site["balance"] - amt)
     update_balance_by_token(dest["token"], dest["balance"] + amt)
     log_transaction(from_site["token"], from_site["name"], dest["token"], dest["name"], amt, reason)
@@ -686,9 +711,9 @@ def admin_adjust(token: str = Form(""), delta: float = Form(0.0), key: str = For
     if not require_key(key): return render_page("<h3>Accesso negato</h3>", "403")
     site = get_by_token(token)
     if not site: return render_page("<h3>Carta non trovata</h3>", "Errore")
-    try: d = float(delta)
+    try: float(delta)
     except: return render_page("<h3>Delta non valido</h3>", "Errore")
-    adjust_balance(token, d)
+    adjust_balance(token, float(delta))
     return RedirectResponse(f"/admin?key={key}", 302)
 
 @app.post("/admin/reset", response_class=HTMLResponse)
