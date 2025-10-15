@@ -2421,4 +2421,34 @@ def buy(request: Request, item_code: str = Form(...)):
         log_transaction(None, "Negozio", site["token"], site["name"], 35.0,
                         "Acquisto Moccolone: bonus iniziale +35; addebito -3/settimana")
         return RedirectResponse("/shop", 302)
+    @app.post("/buy", response_class=HTMLResponse)
+    def buy(request: Request, item_code: str = Form(...)):
+        sid = request.cookies.get(SESSION_COOKIE_NAME)
+        if not sid: return render_page("<h3>Sessione mancante</h3>", "Richiesto")
+        session = get_session_info(sid)
+        if not session: return render_page("<h3>Sessione scaduta</h3>", "Scaduta")
+        if int(time.time()) - session["created_at"] > SCAN_WINDOW:
+            return render_page("<h3>Sessione non valida</h3>", "Errore")
+        apply_recurring_charges(session["token"])
+        site = get_by_token(session["token"])
+        if not site: return render_page("<h3>Tag non valido</h3>", "Errore")
+        if site["balance"] < 30.0:
+            return render_page("<h3>Negozio bloccato (saldo < 30)</h3>", "Negozio")
+        if item_code != "moccolone":
+            return render_page("<h3>Articolo non valido</h3>", "Errore")
+        r = exec_sql("SELECT 1 FROM purchases WHERE token=? AND item_code='moccolone' AND active=1",
+                     (site["token"]), fetch="one")
+        # assicurati che params sia una tupla
+        if isinstance((site["token"]), str):
+            r = exec_sql("SELECT 1 FROM purchases WHERE token=? AND item_code='moccolone' AND active=1",
+                         (site["token"],), fetch="one")
+        if r:
+            return render_page("<h3>Già possiedi Moccolone</h3><p><a href='/shop'>Indietro</a></p>", "Negozio")
+        now = int(time.time())
+        exec_sql("UPDATE cards SET balance = balance + ? WHERE token=?", (35.0, site["token"]))
+        exec_sql("INSERT INTO purchases (token,item_code,item_name,weekly_deduction,next_charge_at,started_at,active) VALUES (?,?,?,?,?,?,1)",
+                 (site["token"], "moccolone", "Moccolone pencs", 3.0, now + WEEK_SECONDS, now))
+        log_transaction(None, "Negozio", site["token"], site["name"], 35.0,
+                        "Acquisto Moccolone: bonus iniziale +35; addebito -3/settimana")
+        return RedirectResponse("/shop", 302)
     return RedirectResponse("/shop", 302)
